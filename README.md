@@ -1,4 +1,4 @@
-# idempotency
+# idempotency4j
 
 The first answer to a client's `Idempotency-Key`, kept in a table in the module's own schema and
 written in the same transaction as the work, so a retry gets the same answer and a different

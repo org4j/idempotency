@@ -1,8 +1,8 @@
 // Idempotency for any module: the first answer to a client's key, kept in the module's own schema and
 // in the transaction that made it, so a retry gets the same answer and a different request is refused.
 plugins {
-    id 'platform.library'
-    id 'platform.integration-test'
+    alias(libs.plugins.platform.library)
+    alias(libs.plugins.platform.integration.test)
 }
 
 dependencies {
