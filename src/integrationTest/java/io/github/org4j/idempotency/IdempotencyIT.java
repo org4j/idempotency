@@ -1,9 +1,12 @@
-package uz.khakimjanovich.idempotency4j;
+package io.github.org4j.idempotency;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.org4j.error.GeneralException;
+import io.github.org4j.error.StatusThrowable;
+import io.github.org4j.persistence.ModulePersistence;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -27,9 +30,6 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.json.JsonMapper;
-import uz.khakimjanovich.error4j.GeneralException;
-import uz.khakimjanovich.error4j.StatusThrowable;
-import uz.khakimjanovich.persistence4j.ModulePersistence;
 
 @Testcontainers
 class IdempotencyIT {

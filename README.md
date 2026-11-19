@@ -1,14 +1,14 @@
-# idempotency4j
+# idempotency
 
 The first answer to a client's `Idempotency-Key`, kept in a table in the module's own schema and
 written in the same transaction as the work, so a retry gets the same answer and a different
 request with the same key is refused.
 
 ```groovy
-implementation libs.idempotency4j
+implementation libs.idempotency
 ```
 
-The module's changelog sets the table's place, then includes the platform's:
+The module's changelog sets the table's place, then includes org4j's:
 
 ```yaml
 databaseChangeLog:
@@ -42,6 +42,6 @@ idempotency.run(clientId, key, requestHash, () -> cancel(request));
 
 ## Tests
 
-`./gradlew -p platform :idempotency:check`: replays, a reused key, two clients with one key, a refusal freeing the key, work without an
+`./gradlew check`: replays, a reused key, two clients with one key, a refusal freeing the key, work without an
 answer never run again, ten concurrent requests running the work once, `keep`, and the purge, on a
 real Postgres.

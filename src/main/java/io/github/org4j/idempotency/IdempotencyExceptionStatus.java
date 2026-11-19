@@ -1,6 +1,6 @@
-package uz.khakimjanovich.idempotency4j;
+package io.github.org4j.idempotency;
 
-import uz.khakimjanovich.error4j.StatusThrowable;
+import io.github.org4j.error.StatusThrowable;
 
 public enum IdempotencyExceptionStatus implements StatusThrowable {
   IDEMPOTENCY_KEY_REUSED,
