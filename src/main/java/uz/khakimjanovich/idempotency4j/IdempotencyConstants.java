@@ -1,4 +1,4 @@
-package uz.khakimjanovich.platform.idempotency;
+package uz.khakimjanovich.idempotency4j;
 
 import java.time.Duration;
 import java.util.regex.Pattern;

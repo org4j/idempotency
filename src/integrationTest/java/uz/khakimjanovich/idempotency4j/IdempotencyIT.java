@@ -1,4 +1,4 @@
-package uz.khakimjanovich.platform.idempotency;
+package uz.khakimjanovich.idempotency4j;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -27,9 +27,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.json.JsonMapper;
-import uz.khakimjanovich.platform.error.GeneralException;
-import uz.khakimjanovich.platform.error.StatusThrowable;
-import uz.khakimjanovich.platform.persistence.ModulePersistence;
+import uz.khakimjanovich.error4j.GeneralException;
+import uz.khakimjanovich.error4j.StatusThrowable;
+import uz.khakimjanovich.persistence4j.ModulePersistence;
 
 @Testcontainers
 class IdempotencyIT {

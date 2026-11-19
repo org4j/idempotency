@@ -1,4 +1,4 @@
-package uz.khakimjanovich.platform.idempotency;
+package uz.khakimjanovich.idempotency4j;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

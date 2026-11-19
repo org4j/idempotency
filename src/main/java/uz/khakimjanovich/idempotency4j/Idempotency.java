@@ -1,4 +1,4 @@
-package uz.khakimjanovich.platform.idempotency;
+package uz.khakimjanovich.idempotency4j;
 
 import java.sql.Timestamp;
 import java.time.Clock;
@@ -13,7 +13,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.json.JsonMapper;
-import uz.khakimjanovich.platform.error.GeneralException;
+import uz.khakimjanovich.error4j.GeneralException;
 
 public class Idempotency {
 

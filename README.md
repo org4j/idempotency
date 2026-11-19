@@ -5,7 +5,7 @@ written in the same transaction as the work, so a retry gets the same answer and
 request with the same key is refused.
 
 ```groovy
-implementation libs.platform.idempotency
+implementation libs.idempotency4j
 ```
 
 The module's changelog sets the table's place, then includes the platform's:
