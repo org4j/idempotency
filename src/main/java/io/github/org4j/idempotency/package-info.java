@@ -1,4 +1,4 @@
 @NullMarked
-package uz.khakimjanovich.idempotency4j;
+package io.github.org4j.idempotency;
 
 import org.jspecify.annotations.NullMarked;

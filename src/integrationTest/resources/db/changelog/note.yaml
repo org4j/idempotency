@@ -1,4 +1,4 @@
-# A module's changelog: its own table, then the platform's idempotency table in its schema.
+# A module's changelog: its own table, then org4j's idempotency table in its schema.
 databaseChangeLog:
   - property: { name: idempotency.schema, value: note }
   - property: { name: idempotency.table, value: note_idempotency }
