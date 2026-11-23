@@ -19,13 +19,18 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.DefaultResourceLoader;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -84,63 +89,247 @@ class IdempotencyIT {
             "note", "note_idempotency", dataSource, transactionManager, JsonMapper.shared());
   }
 
-  @Test
-  void aRetryGetsTheFirstAnswerAndTheWorkRunsOnce() {
-    var first = idempotency.execute(CLIENT, "k1", "h1", Answer.class, this::note);
-    var retry = idempotency.execute(CLIENT, "k1", "h1", Answer.class, this::note);
+  @Nested
+  class Answers {
 
-    assertThat(first.replayed()).isFalse();
-    assertThat(retry.replayed()).isTrue();
-    assertThat(retry.response()).isEqualTo(first.response());
-    assertThat(runs).hasValue(1);
+    @Test
+    void aRetryGetsTheFirstAnswerAndTheWorkRunsOnce() {
+      var first = idempotency.execute(CLIENT, "k1", "h1", Answer.class, IdempotencyIT.this::note);
+      var retry = idempotency.execute(CLIENT, "k1", "h1", Answer.class, IdempotencyIT.this::note);
+
+      assertThat(first.replayed()).isFalse();
+      assertThat(retry.replayed()).isTrue();
+      assertThat(retry.response()).isEqualTo(first.response());
+      assertThat(runs).hasValue(1);
+    }
+
+    @Test
+    void workWithoutAnAnswerIsReplayedEmpty() {
+      var first = idempotency.run(CLIENT, "k-void", "h1", runs::incrementAndGet);
+      var retry = idempotency.run(CLIENT, "k-void", "h1", runs::incrementAndGet);
+      assertThat(first.replayed()).isFalse();
+      assertThat(retry.replayed()).isTrue();
+      assertThat(retry.response()).isNull();
+      assertThat(runs).hasValue(1);
+    }
+
+    @Test
+    void aKeyReusedForADifferentRequestIsRefused() {
+      idempotency.execute(CLIENT, "k2", "h1", Answer.class, IdempotencyIT.this::note);
+      assertFails(
+          () -> idempotency.execute(CLIENT, "k2", "h2", Answer.class, IdempotencyIT.this::note),
+          IdempotencyExceptionStatus.IDEMPOTENCY_KEY_REUSED);
+    }
+
+    @Test
+    void twoClientsMayUseOneKey() {
+      idempotency.execute(CLIENT, "k3", "h1", Answer.class, IdempotencyIT.this::note);
+      var other =
+          idempotency.execute("client-2", "k3", "h2", Answer.class, IdempotencyIT.this::note);
+      assertThat(other.replayed()).isFalse();
+    }
   }
 
-  @Test
-  void aKeyReusedForADifferentRequestIsRefused() {
-    idempotency.execute(CLIENT, "k2", "h1", Answer.class, this::note);
-    assertThatThrownBy(() -> idempotency.execute(CLIENT, "k2", "h2", Answer.class, this::note))
-        .isInstanceOfSatisfying(
-            GeneralException.class,
-            e ->
-                assertThat(e.getStatus())
-                    .isEqualTo(IdempotencyExceptionStatus.IDEMPOTENCY_KEY_REUSED));
+  @Nested
+  class Outcomes {
+
+    @Test
+    void aRefusalFreesTheKeySoTheRetryRunsIt() {
+      StatusThrowable refused = () -> "REFUSED";
+      assertThatThrownBy(
+              () ->
+                  idempotency.execute(
+                      CLIENT,
+                      "k4",
+                      "h1",
+                      Answer.class,
+                      () -> {
+                        runs.incrementAndGet();
+                        throw new GeneralException(refused);
+                      }))
+          .isInstanceOf(GeneralException.class);
+
+      assertThat(
+              idempotency
+                  .execute(CLIENT, "k4", "h1", Answer.class, IdempotencyIT.this::note)
+                  .replayed())
+          .isFalse();
+      assertThat(runs).hasValue(2);
+    }
+
+    @Test
+    void workThatEndsWithoutAnAnswerIsNeverRunAgain() {
+      unknownOutcome(idempotency, "k7");
+      jdbc.sql("UPDATE note.note_idempotency SET created_at = now() - interval '1 day'").update();
+
+      assertFails(
+          () -> idempotency.execute(CLIENT, "k7", "h1", Answer.class, IdempotencyIT.this::note),
+          IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS);
+      assertThat(runs).hasValue(1);
+    }
+
+    @Test
+    void withAnInProgressTimeoutItRunsAgainOnceThatHasPassed() {
+      var rerunnable = idempotency(null, Duration.ofMinutes(2), Clock.systemUTC());
+      unknownOutcome(rerunnable, "k-crashed");
+      assertFails(
+          () ->
+              rerunnable.execute(CLIENT, "k-crashed", "h1", Answer.class, IdempotencyIT.this::note),
+          IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS);
+
+      jdbc.sql("UPDATE note.note_idempotency SET created_at = now() - interval '3 minutes'")
+          .update();
+      var rerun =
+          rerunnable.execute(CLIENT, "k-crashed", "h1", Answer.class, IdempotencyIT.this::note);
+      assertThat(rerun.replayed()).isFalse();
+      assertThat(runs).hasValue(2);
+    }
+
+    @Test
+    void anInProgressTimeoutNeverFreesAnAnsweredKey() {
+      var rerunnable = idempotency(null, Duration.ofMinutes(2), Clock.systemUTC());
+      rerunnable.execute(CLIENT, "k-answered", "h1", Answer.class, IdempotencyIT.this::note);
+      jdbc.sql("UPDATE note.note_idempotency SET created_at = now() - interval '1 day'").update();
+      assertThat(
+              rerunnable
+                  .execute(CLIENT, "k-answered", "h1", Answer.class, IdempotencyIT.this::note)
+                  .replayed())
+          .isTrue();
+    }
   }
 
-  @Test
-  void twoClientsMayUseOneKey() {
-    idempotency.execute(CLIENT, "k3", "h1", Answer.class, this::note);
-    var other = idempotency.execute("client-2", "k3", "h2", Answer.class, this::note);
-    assertThat(other.replayed()).isFalse();
+  @Nested
+  class Concurrency {
+
+    @Test
+    void concurrentRequestsWithOneKeyRunTheWorkOnce() throws Exception {
+      var replies = new ArrayList<Future<Idempotency.Result<Answer>>>();
+      try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+        var start = new CountDownLatch(1);
+        for (int i = 0; i < 10; i++) {
+          replies.add(
+              pool.submit(
+                  () -> {
+                    start.await();
+                    return idempotency.execute(
+                        CLIENT, "k5", "h1", Answer.class, IdempotencyIT.this::slowNote);
+                  }));
+        }
+        start.countDown();
+      }
+      var answered = new ArrayList<Idempotency.Result<Answer>>();
+      var inProgress = 0;
+      for (var reply : replies) {
+        try {
+          answered.add(reply.get());
+        } catch (ExecutionException e) {
+          assertThat(e.getCause())
+              .isInstanceOfSatisfying(
+                  GeneralException.class,
+                  g ->
+                      assertThat(g.getStatus())
+                          .isEqualTo(IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS));
+          inProgress++;
+        }
+      }
+      assertThat(runs).as("the work itself").hasValue(1);
+      assertThat(answered.stream().filter(r -> !r.replayed())).hasSize(1);
+      assertThat(answered.size() + inProgress).isEqualTo(10);
+    }
   }
 
-  @Test
-  void aRefusalFreesTheKeySoTheRetryRunsIt() {
-    StatusThrowable refused = () -> "REFUSED";
+  @Nested
+  class Transactions {
+
+    @Test
+    void workInATransactionThatCommitsIsAnsweredOnceItHas() {
+      var transaction = new TransactionTemplate(transactionManager);
+      var first =
+          transaction.execute(
+              status ->
+                  idempotency.execute(
+                      CLIENT, "k-tx", "h1", Answer.class, IdempotencyIT.this::noteInTransaction));
+      var retry = idempotency.execute(CLIENT, "k-tx", "h1", Answer.class, IdempotencyIT.this::note);
+      assertThat(retry.replayed()).isTrue();
+      assertThat(retry.response()).isEqualTo(Objects.requireNonNull(first).response());
+    }
+
+    @Test
+    void workInATransactionThatRollsBackIsNoAnswerToReplay() {
+      var transaction = new TransactionTemplate(transactionManager);
+      transaction.executeWithoutResult(
+          status -> {
+            idempotency.execute(
+                CLIENT, "k-tx", "h1", Answer.class, IdempotencyIT.this::noteInTransaction);
+            status.setRollbackOnly();
+          });
+      assertThat(jdbc.sql("SELECT count(*) FROM note.note").query(Long.class).single())
+          .as("the work rolled back")
+          .isZero();
+      assertFails(
+          () -> idempotency.execute(CLIENT, "k-tx", "h1", Answer.class, IdempotencyIT.this::note),
+          IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS);
+    }
+  }
+
+  @Nested
+  class Age {
+
+    @Test
+    void aKeyOlderThanItsKeepIsFreeAgain() {
+      var kept = idempotency(Duration.ofHours(1), null, Clock.systemUTC());
+      kept.execute(CLIENT, "k8", "h1", Answer.class, IdempotencyIT.this::note);
+      jdbc.sql("UPDATE note.note_idempotency SET created_at = now() - interval '2 hours'").update();
+
+      assertThat(
+              kept.execute(CLIENT, "k8", "h2", Answer.class, IdempotencyIT.this::note).replayed())
+          .isFalse();
+      assertThat(runs).hasValue(2);
+    }
+
+    @Test
+    void theKeysAgeIsTheClocksNotTheDatabases() {
+      var ahead =
+          idempotency(
+              null, Duration.ofMinutes(2), Clock.offset(Clock.systemUTC(), Duration.ofDays(1)));
+      unknownOutcome(ahead, "k-clock");
+      assertFails(
+          () -> ahead.execute(CLIENT, "k-clock", "h1", Answer.class, IdempotencyIT.this::note),
+          IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS);
+    }
+
+    @Test
+    void purgingForgetsOldKeys() {
+      idempotency.execute(CLIENT, "k6", "h1", Answer.class, IdempotencyIT.this::note);
+      assertThat(idempotency.purgeBefore(Instant.now().minus(Duration.ofHours(1)))).isZero();
+      assertThat(idempotency.purgeBefore(Instant.now().plus(Duration.ofHours(1)))).isOne();
+      assertThat(
+              idempotency
+                  .execute(CLIENT, "k6", "h2", Answer.class, IdempotencyIT.this::note)
+                  .replayed())
+          .isFalse();
+    }
+  }
+
+  private static Idempotency idempotency(
+      @Nullable Duration keep, @Nullable Duration inProgressTimeout, Clock clock) {
+    return new Idempotency(
+        "note",
+        "note_idempotency",
+        dataSource,
+        transactionManager,
+        JsonMapper.shared(),
+        keep,
+        inProgressTimeout,
+        clock);
+  }
+
+  private void unknownOutcome(Idempotency idempotency, String key) {
     assertThatThrownBy(
             () ->
                 idempotency.execute(
                     CLIENT,
-                    "k4",
-                    "h1",
-                    Answer.class,
-                    () -> {
-                      runs.incrementAndGet();
-                      throw new GeneralException(refused);
-                    }))
-        .isInstanceOf(GeneralException.class);
-
-    assertThat(idempotency.execute(CLIENT, "k4", "h1", Answer.class, this::note).replayed())
-        .isFalse();
-    assertThat(runs).hasValue(2);
-  }
-
-  @Test
-  void workThatEndsWithoutAnAnswerIsNeverRunAgain() {
-    assertThatThrownBy(
-            () ->
-                idempotency.execute(
-                    CLIENT,
-                    "k7",
+                    key,
                     "h1",
                     Answer.class,
                     () -> {
@@ -148,171 +337,28 @@ class IdempotencyIT {
                       throw new IllegalStateException("no answer in time");
                     }))
         .isInstanceOf(IllegalStateException.class);
+  }
 
-    assertThatThrownBy(() -> idempotency.execute(CLIENT, "k7", "h1", Answer.class, this::note))
+  private static void assertFails(ThrowingCallable call, IdempotencyExceptionStatus status) {
+    assertThatThrownBy(call)
         .isInstanceOfSatisfying(
-            GeneralException.class,
-            e ->
-                assertThat(e.getStatus())
-                    .isEqualTo(IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS));
-    assertThat(runs).hasValue(1);
-  }
-
-  @Test
-  void concurrentRequestsWithOneKeyRunTheWorkOnce() throws Exception {
-    var replies = new ArrayList<Future<Idempotency.Result<Answer>>>();
-    try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
-      var start = new CountDownLatch(1);
-      for (int i = 0; i < 10; i++) {
-        replies.add(
-            pool.submit(
-                () -> {
-                  start.await();
-                  return idempotency.execute(CLIENT, "k5", "h1", Answer.class, this::slowNote);
-                }));
-      }
-      start.countDown();
-    }
-    var answered = new ArrayList<Idempotency.Result<Answer>>();
-    var inProgress = 0;
-    for (var reply : replies) {
-      try {
-        answered.add(reply.get());
-      } catch (ExecutionException e) {
-        assertThat(e.getCause())
-            .isInstanceOfSatisfying(
-                GeneralException.class,
-                g ->
-                    assertThat(g.getStatus())
-                        .isEqualTo(IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS));
-        inProgress++;
-      }
-    }
-    assertThat(runs).as("the work itself").hasValue(1);
-    assertThat(answered.stream().filter(r -> !r.replayed())).hasSize(1);
-    assertThat(answered.size() + inProgress).isEqualTo(10);
-  }
-
-  @Test
-  void aKeyOlderThanItsKeepIsFreeAgain() {
-    var kept =
-        new Idempotency(
-            "note",
-            "note_idempotency",
-            dataSource,
-            transactionManager,
-            JsonMapper.shared(),
-            Duration.ofHours(1));
-    kept.execute(CLIENT, "k8", "h1", Answer.class, this::note);
-    jdbc.sql("UPDATE note.note_idempotency SET created_at = now() - interval '2 hours'").update();
-
-    assertThat(kept.execute(CLIENT, "k8", "h2", Answer.class, this::note).replayed()).isFalse();
-    assertThat(runs).hasValue(2);
-  }
-
-  @Test
-  void runExecutesVoidWorkAndReplaysEmptyResult() {
-    var voidRuns = new AtomicInteger();
-    var first = idempotency.run(CLIENT, "k-void", "h1", voidRuns::incrementAndGet);
-    assertThat(first.replayed()).isFalse();
-    assertThat(voidRuns).hasValue(1);
-
-    var retry = idempotency.run(CLIENT, "k-void", "h1", voidRuns::incrementAndGet);
-    assertThat(retry.replayed()).isTrue();
-    assertThat(voidRuns).hasValue(1);
-  }
-
-  @Test
-  void anInProgressKeyOlderThanInProgressTimeoutIsReclaimed() {
-    var withTimeout =
-        new Idempotency(
-            "note",
-            "note_idempotency",
-            dataSource,
-            transactionManager,
-            JsonMapper.shared(),
-            null,
-            Duration.ofMinutes(2),
-            Clock.systemUTC());
-
-    // Crash during execution leaving response IS NULL
-    assertThatThrownBy(
-            () ->
-                withTimeout.execute(
-                    CLIENT,
-                    "k-crashed",
-                    "h1",
-                    Answer.class,
-                    () -> {
-                      runs.incrementAndGet();
-                      throw new RuntimeException("node crashed mid-flight");
-                    }))
-        .isInstanceOf(RuntimeException.class);
-
-    // Immediate retry gets IN_PROGRESS
-    assertThatThrownBy(
-            () -> withTimeout.execute(CLIENT, "k-crashed", "h1", Answer.class, this::note))
-        .isInstanceOfSatisfying(
-            GeneralException.class,
-            e ->
-                assertThat(e.getStatus())
-                    .isEqualTo(IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS));
-
-    // Simulate elapsed inProgressTimeout
-    jdbc.sql(
-            "UPDATE note.note_idempotency SET created_at = now() - interval '3 minutes' WHERE idempotency_key = 'k-crashed'")
-        .update();
-
-    // After inProgressTimeout elapses, key is reclaimed and work succeeds
-    var recovered = withTimeout.execute(CLIENT, "k-crashed", "h1", Answer.class, this::note);
-    assertThat(recovered.replayed()).isFalse();
-  }
-
-  @Test
-  void defaultConstructorReclaimsOrphanedInProgressKeyAfterOneMinute() {
-    assertThatThrownBy(
-            () ->
-                idempotency.execute(
-                    CLIENT,
-                    "k-default-timeout",
-                    "h1",
-                    Answer.class,
-                    () -> {
-                      runs.incrementAndGet();
-                      throw new RuntimeException("node crashed mid-flight");
-                    }))
-        .isInstanceOf(RuntimeException.class);
-
-    assertThatThrownBy(
-            () -> idempotency.execute(CLIENT, "k-default-timeout", "h1", Answer.class, this::note))
-        .isInstanceOfSatisfying(
-            GeneralException.class,
-            e ->
-                assertThat(e.getStatus())
-                    .isEqualTo(IdempotencyExceptionStatus.IDEMPOTENCY_IN_PROGRESS));
-
-    jdbc.sql(
-            "UPDATE note.note_idempotency SET created_at = now() - interval '65 seconds' WHERE idempotency_key = 'k-default-timeout'")
-        .update();
-
-    var recovered =
-        idempotency.execute(CLIENT, "k-default-timeout", "h1", Answer.class, this::note);
-    assertThat(recovered.replayed()).isFalse();
-  }
-
-  @Test
-  void purgingForgetsOldKeys() {
-    idempotency.execute(CLIENT, "k6", "h1", Answer.class, this::note);
-    assertThat(idempotency.purgeBefore(Instant.now().minus(Duration.ofHours(1)))).isZero();
-    assertThat(idempotency.purgeBefore(Instant.now().plus(Duration.ofHours(1)))).isOne();
-    assertThat(idempotency.execute(CLIENT, "k6", "h2", Answer.class, this::note).replayed())
-        .isFalse();
+            GeneralException.class, e -> assertThat(e.getStatus()).isEqualTo(status));
   }
 
   private Answer note() {
     runs.incrementAndGet();
     var id = UUID.randomUUID();
     jdbc.sql("INSERT INTO note.note (id) VALUES (:id)").param("id", id).update();
+    return new Answer(id);
+  }
+
+  private Answer noteInTransaction() {
+    runs.incrementAndGet();
+    var id = UUID.randomUUID();
+    JdbcClient.create(new TransactionAwareDataSourceProxy(dataSource))
+        .sql("INSERT INTO note.note (id) VALUES (:id)")
+        .param("id", id)
+        .update();
     return new Answer(id);
   }
 
